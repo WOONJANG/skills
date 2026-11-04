@@ -78,6 +78,49 @@ class RunnerTests(unittest.TestCase):
         self.plan["requirements"]["R02"] = ["missing"]
         self.cli(expected=3)
 
+    def test_finalize_preserves_unresolved_blocker(self):
+        self.cli()
+        review = heal.read(self.review_file)
+        review["issues"] = [{"id": "I1", "category": "LOGIC_ERROR", "location": "app.py",
+                             "evidence": "Observed wrong total", "severity": "HIGH",
+                             "blocking": True, "resolved": False}]
+        heal.write(self.review_file, review)
+        report = self.cli(expected=1, review=False)
+        review["run_id"] = report["run_id"]
+        del review["issues"]
+        heal.write(self.review_file, review)
+        self.cli("finalize", expected=1, review=False)
+        self.assertEqual(heal.read(self.state / "report.json")["blockers"], ["I1"])
+
+    def test_blocked_mapped_check_blocks_overall_verdict(self):
+        self.plan["checks"].append({"id": "missing", "gate": "G07",
+                                    "argv": ["healing-no-such-executable"]})
+        self.plan["requirements"] = {"R01": ["missing"]}
+        report = self.cli(expected=2)
+        self.assertEqual(report["requirements"]["R01"]["status"], "BLOCKED")
+
+    def test_junit_counts_and_redacted_failure_summary(self):
+        command = ("import sys; from pathlib import Path; "
+                   "Path(sys.argv[1]).write_text(sys.argv[2])")
+        check = {"id": "junit", "gate": "G06", "junit": True, "diagnostics": True,
+                 "argv": [PYTHON, "-c", command, "{junit}", "<testsuite/>"]}
+        self.plan["checks"].append(check)
+        self.assertEqual(self.cli(expected=2)["checks"][-1]["test_counts"]["executed"], 0)
+        check["argv"][-1] = ("<testsuite><testcase><skipped/></testcase>"
+                              "<testcase/></testsuite>")
+        row = self.cli()["checks"][-1]
+        self.assertEqual(row["test_counts"], {"executed": 1, "skipped": 1, "failed": 0})
+        check["argv"][-1] = "<testsuite><testcase><failure/></testcase></testsuite>"
+        row = self.cli(expected=1)["checks"][-1]
+        self.assertEqual(row["diagnostics"]["test_counts"]["failed"], 1)
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required")
+    def test_changed_untracked_file_outside_fingerprint(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.plan["source"] = ["app.py"]
+        report = self.cli()
+        self.assertIn("검증 test.py", report["git_scope"]["outside_fingerprint"])
+
     def test_valid_unchanged(self):
         report = self.cli()
         self.assertTrue(report["completed"])

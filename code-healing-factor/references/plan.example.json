@@ -30,11 +30,14 @@
     {
       "id": "unit",
       "gate": "G06",
+      "junit": true,
+      "diagnostics": true,
       "argv": [
         "{python}",
         "-m",
         "pytest",
-        "tests/unit"
+        "tests/unit",
+        "--junitxml={junit}"
       ]
     },
     {

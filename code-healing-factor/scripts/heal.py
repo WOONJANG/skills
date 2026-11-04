@@ -17,6 +17,7 @@ import tempfile
 from threading import Thread
 import time
 from uuid import uuid4
+from xml.etree import ElementTree
 
 GATES = tuple(f"G{i:02}" for i in range(1, 15))
 EXECUTION = {"G04", "G05", "G06", "G07", "G08", "G09", "G11"}
@@ -76,9 +77,8 @@ def relative(value, root):
     return root / path
 
 
-def fingerprint(root, source, exclude=()):
-    """Hash file names and contents under explicit inputs, without following links."""
-    digest = hashlib.sha256()
+def source_files(root, source, exclude=()):
+    """Enumerate explicit fingerprint inputs without following links."""
     excluded = {relative(item, root) for item in exclude}
     files = set()
     pending = [relative(item, root) for item in source]
@@ -95,12 +95,44 @@ def fingerprint(root, source, exclude=()):
             require(stat.S_ISREG(info.st_mode), "Source input must be a regular file")
             files.add(path)
     require(files, "Source inputs contain no files")
+    return files
+
+
+def fingerprint(root, source, exclude=()):
+    digest = hashlib.sha256()
+    files = source_files(root, source, exclude)
     for path in sorted(files, key=lambda item: item.relative_to(root).as_posix()):
         name = path.relative_to(root).as_posix().encode("utf-8")
         with path.open("rb") as stream:
             content = hashlib.file_digest(stream, "sha256").digest()
         digest.update(len(name).to_bytes(8, "big") + name + content)
     return digest.hexdigest()
+
+
+def git_scope(root, plan):
+    """Report visible Git changes outside the current fingerprint inputs."""
+    try:
+        result = subprocess.run(
+            ["git", "--no-optional-locks", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all",
+             "--", "."],
+            cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=10, check=False,
+        )
+        if result.returncode:
+            return {"status": "UNAVAILABLE"}
+        # Porcelain v1 paths are relative to the Git root, including from subdirectories.
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-prefix"], cwd=root, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=True,
+        ).stdout.decode("utf-8", errors="surrogateescape").rstrip("\r\n")
+        changed = {Path(entry[3:]).relative_to(Path(top)) for entry in
+                   result.stdout.decode("utf-8", errors="surrogateescape").split("\0") if entry}
+        tracked = {path.relative_to(root) for path in
+                   source_files(root, plan["source"], plan.get("exclude", []))}
+        return {"status": "CHECKED",
+                "outside_fingerprint": sorted(path.as_posix() for path in changed - tracked)}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {"status": "UNAVAILABLE"}
 
 
 def integer(value, low, high):
@@ -154,7 +186,8 @@ def config(path):
     ids = set()
     for check in checks:
         require(isinstance(check, dict) and
-                set(check) <= {"id", "gate", "argv", "cwd", "timeout", "stdout_sha256"},
+                set(check) <= {"id", "gate", "argv", "cwd", "timeout", "stdout_sha256",
+                               "junit", "diagnostics"},
                 "Invalid check fields")
         ident, argv = check.get("id"), check.get("argv")
         require(isinstance(ident, str) and ident.strip() and ident not in ids,
@@ -166,6 +199,10 @@ def config(path):
         require(isinstance(check.get("cwd", "."), str) and
                 integer(check.get("timeout", limits["timeout"]), 1, 3600),
                 "Invalid check cwd or timeout")
+        require(all(type(check.get(field, False)) is bool for field in ("junit", "diagnostics")),
+                "junit and diagnostics must be boolean")
+        require(not check.get("junit") or any("{junit}" in arg for arg in argv[1:]),
+                "JUnit checks must pass {junit} in argv")
         oracle = check.get("stdout_sha256")
         require(oracle is None or (isinstance(oracle, str) and len(oracle) == 64 and
                                    all(ch in "0123456789abcdef" for ch in oracle)),
@@ -223,7 +260,38 @@ def output_digest(argv, cwd, seconds, limit):
             process.wait()
 
 
-def execute(check, root, limits, deadline):
+def junit_counts(path):
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(4 * 1024 * 1024 + 1)
+        if len(raw) > 4 * 1024 * 1024:
+            return None
+        xml = raw.decode("utf-8-sig")
+        if "<!DOCTYPE" in xml or "\0" in xml:
+            return None
+        root = ElementTree.fromstring(xml)
+        if root.tag not in {"testsuites", "testsuite"}:
+            return None
+        tests = list(root.iter("testcase"))
+        skipped = sum(test.find("skipped") is not None for test in tests)
+        failed = sum(test.find("failure") is not None or test.find("error") is not None
+                     for test in tests)
+        return {"executed": len(tests) - skipped, "skipped": skipped, "failed": failed}
+    except (OSError, UnicodeError, ElementTree.ParseError):
+        return None
+
+
+def run_check(argv, cwd, seconds, limits, oracle):
+    if oracle:
+        return output_digest(argv, cwd, seconds, limits["stdout_bytes"])
+    code = subprocess.run(argv, cwd=cwd, timeout=seconds, check=False,
+                          stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          stdout=subprocess.DEVNULL).returncode
+    return code, None
+
+
+def execute(check, root, limits, deadline, state=None):
+    started = time.monotonic()
     argv = check["argv"][:]
     cwd = relative(check.get("cwd", "."), root)
     row = {"id": check["id"], "gate": check["gate"], "argv": argv[:],
@@ -245,13 +313,17 @@ def execute(check, root, limits, deadline):
         else:
             try:
                 oracle = check.get("stdout_sha256")
-                if oracle:
-                    code, actual = output_digest(argv, cwd, seconds, limits["stdout_bytes"])
+                counts = None
+                if check.get("junit"):
+                    with tempfile.TemporaryDirectory(dir=state) as directory:
+                        result_path = Path(directory) / "result.xml"
+                        command = [argv[0], *(arg.replace("{junit}", str(result_path))
+                                              for arg in argv[1:])]
+                        code, actual = run_check(command, cwd, seconds, limits, oracle)
+                        counts = junit_counts(result_path)
+                        row["test_counts"] = counts
                 else:
-                    code = subprocess.run(argv, cwd=cwd, timeout=seconds, check=False,
-                                          stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                          stdout=subprocess.DEVNULL).returncode
-                    actual = None
+                    code, actual = run_check(argv, cwd, seconds, limits, oracle)
                 row["exit_code"] = code
                 if code is None:
                     reason = "Stdout limit exceeded or output unavailable"
@@ -259,6 +331,10 @@ def execute(check, root, limits, deadline):
                     status, reason = "FAIL", "Nonzero exit"
                 elif actual != oracle:
                     status, reason = "FAIL", "Stdout digest mismatch"
+                elif counts and counts["failed"]:
+                    status, reason = "FAIL", "JUnit reported failed tests"
+                elif check.get("junit") and (counts is None or not counts["executed"]):
+                    reason = "JUnit report unavailable or no tests executed"
                 else:
                     status, reason = "PASS", "Exit and configured oracle satisfied"
             except subprocess.TimeoutExpired:
@@ -266,6 +342,10 @@ def execute(check, root, limits, deadline):
             except OSError:
                 reason = "Command could not start"
     row.update(status=status, reason=reason, ended=now())
+    if check.get("diagnostics") and status != "PASS":
+        row["diagnostics"] = {"reason": reason, "exit_code": row["exit_code"],
+                              "duration_ms": round((time.monotonic() - started) * 1000),
+                              "test_counts": row.get("test_counts")}
     return row
 
 
@@ -298,6 +378,13 @@ def assessment(path, stamp, root):
     return gates, issues
 
 
+def is_blocker(issue, plan):
+    threshold = SEVERITIES.index(plan["security_threshold"])
+    return not issue["resolved"] and (
+        issue["blocking"] or (issue["category"] == "SECURITY_VULNERABILITY" and
+                              SEVERITIES.index(issue["severity"]) >= threshold))
+
+
 def evaluate(plan, rows, review, issues, stable):
     gates = {}
     for gate in GATES:
@@ -310,15 +397,14 @@ def evaluate(plan, rows, review, issues, stable):
         status = status or ("PASS" if positive else
                             "NOT_APPLICABLE" if "NOT_APPLICABLE" in states else "NOT_RUN")
         gates[gate] = status if stable else "NOT_RUN"
-    threshold = SEVERITIES.index(plan["security_threshold"])
-    blockers = [issue["id"] for issue in issues if not issue["resolved"] and (
-        issue["blocking"] or (issue["category"] == "SECURITY_VULNERABILITY" and
-                             SEVERITIES.index(issue["severity"]) >= threshold))]
+    blockers = [issue["id"] for issue in issues if is_blocker(issue, plan)]
     if not stable:
         return "BLOCKED", gates, []
     if blockers or "FAIL" in gates.values():
         return "FAILED", gates, blockers
-    if any(gates[gate] != "PASS" for gate in plan["required"]):
+    required_checks = {link for links in plan.get("requirements", {}).values() for link in links}
+    if (any(gates[gate] != "PASS" for gate in plan["required"])
+            or any(row["status"] != "PASS" for row in rows if row["id"] in required_checks)):
         return "BLOCKED", gates, blockers
     return "PASS", gates, blockers
 
@@ -391,6 +477,17 @@ def finalize(report_path, root, plan, assessment_path, stamp):
               file=sys.stderr)
         return 2
     review, issues = assessment(assessment_path, stamp, root)
+    # A new review may add findings. Resolving a recorded finding requires a new run.
+    prior_issues = {issue["id"]: issue for issue in report["issues"]}
+    for issue in issues:
+        prior = prior_issues.get(issue["id"])
+        if (prior is None or prior["resolved"] or
+                (is_blocker(issue, plan) and not is_blocker(prior, plan))):
+            prior_issues[issue["id"]] = issue
+    issues = list(prior_issues.values())
+    for gate, previous in report["assessment"].items():
+        if previous["status"] == "FAIL" or gate not in review:
+            review[gate] = previous
     status, gates, blockers = evaluate(plan, report["checks"], review, issues, True)
     report.update(status=status, gates=gates, assessment=review, issues=issues,
                   blockers=blockers, completed=status == "PASS")
@@ -441,9 +538,10 @@ def main():
             before = stamp()
             deadline = time.monotonic() + plan["limits"]["total_seconds"]
             with ThreadPoolExecutor(max_workers=plan["limits"]["workers"]) as pool:
-                rows = list(pool.map(lambda check: execute(check, root, plan["limits"], deadline),
+                rows = list(pool.map(lambda check: execute(check, root, plan["limits"], deadline, state),
                                      plan.get("checks", [])))
             review, issues = assessment(args.assessment, before, root)
+            scope = git_scope(root, plan)
             try:
                 after = stamp()
             except (ValueError, OSError):
@@ -453,7 +551,7 @@ def main():
             report = {"skill": SKILL, "schema_version": "1.0", "project": str(root),
                       "status": status, "level": plan["level"], "plan": plan, "source_fingerprint": after,
                       "run_id": uuid4().hex, "run_started_ns": run_started_ns, "stable": stable,
-                      "requirements": requirement_results(plan, rows, stable),
+                      "requirements": requirement_results(plan, rows, stable), "git_scope": scope,
                       "checked_fingerprint": before, "required": plan["required"],
                       "gates": gates, "checks": rows, "assessment": review,
                       "issues": issues, "blockers": blockers, "completed": status == "PASS",

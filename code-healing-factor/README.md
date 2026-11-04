@@ -14,6 +14,13 @@ Invoke `$code-healing-factor` in Codex and describe what to verify or repair. Fo
 
 The evidence runner requires Python 3.11 or later. See the [runner guide](references/runner.md) for plans, evidence, and finalization. See the [activation guide](references/activation.md) for optional Stop hook setup.
 
+## Evidence
+
+- Linked requirement checks must pass before the run can pass.
+- Finalization keeps unresolved findings and reuses the reviewed execution.
+- Optional JUnit XML reports supply execution and skip counts.
+- Git scope reporting flags visible worktree changes outside the fingerprint.
+
 ## Test
 
 Run from the repository root:

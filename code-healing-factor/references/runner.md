@@ -20,3 +20,13 @@ Run exit codes are 0 PASS, 1 FAILED, 2 BLOCKED, 3 invalid or unusable inputs. He
 
 
 For STANDARD and STRICT plans, add a requirements object mapping each significant behavioral requirement ID to one or more execution check IDs. The report lists the mapped check outcomes by requirement. Review assertion coverage, test collection and skipped tests separately. Existing plans without the mapping remain valid.
+
+## Completion and diagnostic details
+
+All checks linked to a requirement must pass for the overall result to pass. Finalizing a run retains its unresolved findings and failed review gates. Record any verified resolution in a fresh run. An assessment can still add findings during finalization.
+
+The report includes git_scope. On Git worktrees it lists staged, unstaged, and untracked paths outside the current fingerprint file set, including deleted paths. Review each relevant path and adjust the plan before rerunning. Scope reporting is advisory and returns UNAVAILABLE if Git or the file inventory cannot be read. Ignored paths are outside Git status and still need explicit inclusion when they affect verification.
+
+For pytest, set junit to true and add --junitxml={junit} as one argv element. The runner reads counts from a fresh private JUnit XML file, then discards it. A successful command with no executed cases or missing or invalid XML is BLOCKED. Failed cases or a nonzero command exit are FAIL. Counts cover tests represented in the XML, so deselected cases may be absent. Other test runners can use the same option if they emit UTF-8 JUnit XML with testcase elements.
+
+Set diagnostics to true to keep a structured failure summary from the original execution. It includes the reason, exit code, duration in milliseconds, and any JUnit counts. It omits raw output, assertion messages, and test names. The report still records configured argv and Git paths, so review it before sharing.
