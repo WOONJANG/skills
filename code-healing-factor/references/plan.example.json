@@ -1,0 +1,59 @@
+{
+  "schema_version": "1.0",
+  "level": "STANDARD",
+  "source": [
+    "src",
+    "tests",
+    "pyproject.toml"
+  ],
+  "exclude": [],
+  "required": [
+    "G04",
+    "G06",
+    "G13"
+  ],
+  "checks": [
+    {
+      "id": "syntax",
+      "gate": "G04",
+      "argv": [
+        "{python}",
+        "-m",
+        "compileall",
+        "-q",
+        "src"
+      ]
+    },
+    {
+      "id": "unit",
+      "gate": "G06",
+      "argv": [
+        "{python}",
+        "-m",
+        "pytest",
+        "tests/unit"
+      ]
+    },
+    {
+      "id": "regression",
+      "gate": "G11",
+      "argv": [
+        "{python}",
+        "-m",
+        "pytest",
+        "tests"
+      ]
+    }
+  ],
+  "limits": {
+    "timeout": 60,
+    "total_seconds": 600,
+    "workers": 1
+  },
+  "repair": {
+    "max_iterations": 8,
+    "no_progress_threshold": 2,
+    "change_strategy_on_stagnation": true
+  },
+  "security_threshold": "HIGH"
+}

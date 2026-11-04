@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:/absolute/python.exe\" -B \"C:/absolute/skill/scripts/stop_hook.py\" --root \"C:/absolute/project\" --plan \"C:/absolute/plan.json\" --state \"C:/absolute/task-state\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
