@@ -12,6 +12,9 @@
     "G06",
     "G13"
   ],
+  "requirements": {
+    "R01": ["unit", "regression"]
+  },
   "checks": [
     {
       "id": "syntax",

@@ -54,6 +54,30 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, expected, result.stderr + result.stdout)
         return heal.read(self.state / "report.json") if action == "run" and expected != 3 else result.stdout
 
+    def test_finalize_reuses_reviewed_execution(self):
+        self.cli()
+        assessment = heal.read(self.review_file)
+        final_gate = assessment["gates"].pop("G14")
+        heal.write(self.review_file, assessment)
+        pending = self.cli(expected=2, review=False)
+        assessment["gates"]["G14"] = final_gate
+        assessment["run_id"] = pending.get("run_id")
+        heal.write(self.review_file, assessment)
+        self.cli("finalize", review=False)
+        report = heal.read(self.state / "report.json")
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["checks"], pending["checks"])
+        self.assertEqual(report["run_id"], pending["run_id"])
+        self.source.write_text(CORRECT + "# edit\n")
+        self.cli("finalize", expected=2, review=False)
+
+    def test_requirement_links_are_reported_and_validated(self):
+        self.plan["requirements"] = {"R01": ["behavior", "regression"]}
+        self.assertEqual(self.cli()["requirements"],
+                         {"R01": {"checks": ["behavior", "regression"], "status": "PASS"}})
+        self.plan["requirements"]["R02"] = ["missing"]
+        self.cli(expected=3)
+
     def test_valid_unchanged(self):
         report = self.cli()
         self.assertTrue(report["completed"])

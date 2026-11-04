@@ -16,6 +16,7 @@ import sys
 import tempfile
 from threading import Thread
 import time
+from uuid import uuid4
 
 GATES = tuple(f"G{i:02}" for i in range(1, 15))
 EXECUTION = {"G04", "G05", "G06", "G07", "G08", "G09", "G11"}
@@ -111,7 +112,7 @@ def config(path):
     require(isinstance(plan, dict) and plan.get("schema_version") == "1.0",
             "Plan schema_version must be 1.0")
     require(set(plan) <= {"schema_version", "source", "exclude", "level", "required",
-                          "checks", "limits", "security_threshold", "repair"},
+                          "checks", "limits", "security_threshold", "repair", "requirements"},
             "Unknown plan field")
     for field in ("source", "exclude"):
         values = plan.get(field, [])
@@ -169,6 +170,16 @@ def config(path):
         require(oracle is None or (isinstance(oracle, str) and len(oracle) == 64 and
                                    all(ch in "0123456789abcdef" for ch in oracle)),
                 "Expected lowercase stdout SHA-256")
+    requirements = plan.get("requirements", {})
+    require(isinstance(requirements, dict), "Requirements must map IDs to execution check IDs")
+    execution_ids = {check["id"] for check in checks if check["gate"] in EXECUTION}
+    for ident, links in requirements.items():
+        require(ident.strip() and isinstance(links, list) and links and
+                all(isinstance(link, str) and link in execution_ids for link in links) and
+                len(links) == len(set(links)),
+                f"Invalid execution check links for requirement {ident}")
+    if "requirements" in plan:
+        require(requirements, "Requirements must contain at least one mapping")
     return plan
 
 
@@ -359,9 +370,38 @@ def discover(root):
                              if (path / "AGENTS.md").is_file()]}
 
 
+def requirement_results(plan, rows, stable):
+    checks = {row["id"]: row["status"] for row in rows}
+    results = {}
+    for ident, links in plan.get("requirements", {}).items():
+        states = {checks[link] for link in links} if stable else {"NOT_RUN"}
+        status = next(state for state in ("FAIL", "BLOCKED", "NOT_RUN", "PASS")
+                      if state in states)
+        results[ident] = {"checks": links, "status": status}
+    return results
+
+
+def finalize(report_path, root, plan, assessment_path, stamp):
+    report = read(report_path) if report_path.exists() else {}
+    run_id = report.get("run_id")
+    if not (run_id and report.get("stable") is True and report.get("project") == str(root) and report.get("plan") == plan
+            and report.get("checked_fingerprint") == report.get("source_fingerprint") == stamp
+            and assessment_path and read(assessment_path).get("run_id") == run_id):
+        print("BLOCKED: Final assessment must identify the current reviewed execution",
+              file=sys.stderr)
+        return 2
+    review, issues = assessment(assessment_path, stamp, root)
+    status, gates, blockers = evaluate(plan, report["checks"], review, issues, True)
+    report.update(status=status, gates=gates, assessment=review, issues=issues,
+                  blockers=blockers, completed=status == "PASS")
+    write(report_path, report)
+    print(json.dumps({"status": status, "report": str(report_path)}))
+    return EXIT[status]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("discover", "fingerprint", "run", "attempt"))
+    parser.add_argument("action", choices=("discover", "fingerprint", "run", "attempt", "finalize"))
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--state", type=Path)
@@ -392,9 +432,12 @@ def main():
             history = read(history_path) if history_path.exists() else {"project": str(root), "attempts": []}
             require(history.get("project") == str(root), "History belongs to another project")
             report_path = state / "report.json"
+            if args.action == "finalize":
+                return finalize(report_path, root, plan, args.assessment, stamp())
             # Replace any old success before running a new check set.
             write(report_path, {"skill": SKILL, "schema_version": "1.0", "project": str(root),
                                 "status": "BLOCKED", "reason": "Verification incomplete"})
+            run_started_ns = time.time_ns()
             before = stamp()
             deadline = time.monotonic() + plan["limits"]["total_seconds"]
             with ThreadPoolExecutor(max_workers=plan["limits"]["workers"]) as pool:
@@ -405,10 +448,12 @@ def main():
                 after = stamp()
             except (ValueError, OSError):
                 after = None
-            status, gates, blockers = evaluate(
-                plan, rows, review, issues, before == after and config(args.plan) == plan)
+            stable = before == after and config(args.plan) == plan
+            status, gates, blockers = evaluate(plan, rows, review, issues, stable)
             report = {"skill": SKILL, "schema_version": "1.0", "project": str(root),
                       "status": status, "level": plan["level"], "plan": plan, "source_fingerprint": after,
+                      "run_id": uuid4().hex, "run_started_ns": run_started_ns, "stable": stable,
+                      "requirements": requirement_results(plan, rows, stable),
                       "checked_fingerprint": before, "required": plan["required"],
                       "gates": gates, "checks": rows, "assessment": review,
                       "issues": issues, "blockers": blockers, "completed": status == "PASS",

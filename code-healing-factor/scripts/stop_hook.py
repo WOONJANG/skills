@@ -37,7 +37,8 @@ def respond(event, root, plan_file, state):
                 report.get("skill") == SKILL and report.get("schema_version") == "1.0" and
                 report.get("project") == str(root) and report.get("source_fingerprint") == stamp and
                 report.get("checked_fingerprint") == stamp and report.get("plan") == plan and
-                report_file.stat().st_mtime_ns >= (state / "arm.json").stat().st_mtime_ns and
+                report.get("run_started_ns", report_file.stat().st_mtime_ns) >=
+                (state / "arm.json").stat().st_mtime_ns and
                 report.get("blockers") == [] and
                 "FAIL" not in report["gates"].values() and
                 all(report["gates"].get(gate) == "PASS" for gate in required)):
