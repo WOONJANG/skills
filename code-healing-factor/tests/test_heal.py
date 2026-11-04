@@ -121,6 +121,54 @@ class RunnerTests(unittest.TestCase):
         report = self.cli()
         self.assertIn("검증 test.py", report["git_scope"]["outside_fingerprint"])
 
+    def test_finalize_rejects_assessment_for_other_evidence(self):
+        report = self.cli()
+        review = heal.read(self.review_file)
+        review["run_id"] = report["run_id"]
+        review["gates"]["G14"]["status"] = "FAIL"
+        for key in ("project", "fingerprint", "run_id"):
+            with self.subTest(key=key):
+                heal.write(self.review_file, review | {key: "wrong"})
+                self.cli("finalize", expected=2, review=False)
+                self.assertEqual(heal.read(self.state / "report.json"), report)
+        heal.write(self.review_file, review)
+        self.cli("finalize", expected=1, review=False)
+
+    @unittest.skipUnless(shutil.which("git"), "Git is required")
+    def test_finalize_refreshes_scope_without_reexecuting_checks(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.plan["source"] = ["app.py"]
+        initial = self.cli()
+        review = heal.read(self.review_file)
+        heal.write(self.review_file, review | {"run_id": initial["run_id"]})
+        (self.root / "new.lock").write_text("new")
+        self.cli("finalize", review=False)
+        final = heal.read(self.state / "report.json")
+        self.assertEqual(final["checks"], initial["checks"])
+        self.assertEqual(final["checked_git_scope"], initial["git_scope"])
+        self.assertIn("new.lock", final["git_scope"]["outside_fingerprint"])
+
+    def test_junit_suite_errors_and_inconsistent_totals_prevent_pass(self):
+        command = ("import sys; from pathlib import Path; "
+                   "Path(sys.argv[1]).write_text(sys.argv[2])")
+        check = {"id": "xml", "gate": "G06", "junit": True,
+                 "argv": [PYTHON, "-c", command, "{junit}", ""]}
+        self.plan["checks"].append(check)
+        cases = [
+            ('<testsuite tests="1" errors="1"><error/><testcase/></testsuite>', 1),
+            ('<testsuites failures="1"><testsuite><testcase/></testsuite></testsuites>', 1),
+            ('<testsuites><testsuite errors="1"/><testsuite><testcase/></testsuite></testsuites>', 1),
+            ('<testsuite errors="0"><testcase><error/></testcase></testsuite>', 1),
+            ('<testsuite tests="2"><testcase/></testsuite>', 2),
+            ('<testsuite tests="1" skipped="1"><testcase><skipped/></testcase></testsuite>', 2),
+            ('<testsuites tests="2" skipped="1"><testsuite tests="2"><testcase/>'
+             '<testcase><skipped/></testcase></testsuite></testsuites>', 0),
+        ]
+        for xml, exit_code in cases:
+            with self.subTest(xml=xml):
+                check["argv"][-1] = xml
+                self.cli(expected=exit_code)
+
     def test_valid_unchanged(self):
         report = self.cli()
         self.assertTrue(report["completed"])

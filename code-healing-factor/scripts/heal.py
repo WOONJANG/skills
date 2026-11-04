@@ -260,8 +260,39 @@ def output_digest(argv, cwd, seconds, limit):
             process.wait()
 
 
+def junit_totals(root):
+    totals = {}
+    consistent = True
+    suite_tags = {"testsuite", "testsuites"}
+    for suite in reversed(list(root.iter())):
+        if suite.tag not in suite_tags:
+            continue
+        cases = suite.findall("testcase")
+        children = [totals[child] for child in suite if child.tag in suite_tags]
+        tests = len(cases) + sum(child[0] for child in children)
+        skipped = (sum(case.find("skipped") is not None for case in cases)
+                   + sum(child[1] for child in children))
+        failed = (sum(case.find("failure") is not None or case.find("error") is not None
+                      for case in cases) + len(suite.findall("error"))
+                  + len(suite.findall("failure")) + sum(child[2] for child in children))
+        declared = {key: int(suite.attrib[key]) for key in ("tests", "skipped", "errors", "failures")
+                    if key in suite.attrib}
+        consistent &= (all(value >= 0 for value in declared.values())
+                       and declared.get("tests", tests) == tests
+                       and declared.get("skipped", skipped) == skipped)
+        # Parent summaries include children. Do not count both as separate failures.
+        failed = max(failed, declared.get("errors", 0) + declared.get("failures", 0))
+        totals[suite] = tests, skipped, failed
+    tests, skipped, failed = totals[root]
+    if not consistent and not failed:
+        return None
+    return {"executed": tests - skipped, "skipped": skipped, "failed": failed}
+
+
 def junit_counts(path):
     try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return None
         with path.open("rb") as stream:
             raw = stream.read(4 * 1024 * 1024 + 1)
         if len(raw) > 4 * 1024 * 1024:
@@ -272,12 +303,8 @@ def junit_counts(path):
         root = ElementTree.fromstring(xml)
         if root.tag not in {"testsuites", "testsuite"}:
             return None
-        tests = list(root.iter("testcase"))
-        skipped = sum(test.find("skipped") is not None for test in tests)
-        failed = sum(test.find("failure") is not None or test.find("error") is not None
-                     for test in tests)
-        return {"executed": len(tests) - skipped, "skipped": skipped, "failed": failed}
-    except (OSError, UnicodeError, ElementTree.ParseError):
+        return junit_totals(root)
+    except (OSError, ValueError, ElementTree.ParseError):
         return None
 
 
@@ -349,12 +376,13 @@ def execute(check, root, limits, deadline, state=None):
     return row
 
 
-def assessment(path, stamp, root):
-    if path is None:
-        return {}, []
-    data = read(path)
+def assessment_matches(data, stamp, root):
+    return data.get("fingerprint") == stamp and data.get("project") == str(root)
+
+
+def assessment(data, stamp, root):
     require(isinstance(data, dict), "Invalid assessment")
-    if data.get("fingerprint") != stamp or data.get("project") != str(root):
+    if not assessment_matches(data, stamp, root):
         return {}, []
     gates, issues = data.get("gates", {}), data.get("issues", [])
     require(isinstance(gates, dict) and isinstance(issues, list), "Invalid assessment")
@@ -469,14 +497,18 @@ def requirement_results(plan, rows, stable):
 
 def finalize(report_path, root, plan, assessment_path, stamp):
     report = read(report_path) if report_path.exists() else {}
+    data = read(assessment_path) if assessment_path else {}
     run_id = report.get("run_id")
-    if not (run_id and report.get("stable") is True and report.get("project") == str(root) and report.get("plan") == plan
-            and report.get("checked_fingerprint") == report.get("source_fingerprint") == stamp
-            and assessment_path and read(assessment_path).get("run_id") == run_id):
+    fingerprint_now = stamp()
+    if not (run_id and report.get("stable") is True and report.get("project") == str(root)
+            and report.get("plan") == plan
+            and report.get("checked_fingerprint") == report.get("source_fingerprint") == fingerprint_now
+            and isinstance(data, dict) and data.get("run_id") == run_id
+            and assessment_matches(data, fingerprint_now, root)):
         print("BLOCKED: Final assessment must identify the current reviewed execution",
               file=sys.stderr)
         return 2
-    review, issues = assessment(assessment_path, stamp, root)
+    review, issues = assessment(data, fingerprint_now, root)
     # A new review may add findings. Resolving a recorded finding requires a new run.
     prior_issues = {issue["id"]: issue for issue in report["issues"]}
     for issue in issues:
@@ -489,7 +521,12 @@ def finalize(report_path, root, plan, assessment_path, stamp):
         if previous["status"] == "FAIL" or gate not in review:
             review[gate] = previous
     status, gates, blockers = evaluate(plan, report["checks"], review, issues, True)
-    report.update(status=status, gates=gates, assessment=review, issues=issues,
+    scope = git_scope(root, plan)
+    if stamp() != fingerprint_now:
+        print("BLOCKED: Source changed during finalization", file=sys.stderr)
+        return 2
+    report.setdefault("checked_git_scope", report.get("git_scope", {"status": "UNAVAILABLE"}))
+    report.update(status=status, gates=gates, assessment=review, issues=issues, git_scope=scope,
                   blockers=blockers, completed=status == "PASS")
     write(report_path, report)
     print(json.dumps({"status": status, "report": str(report_path)}))
@@ -530,7 +567,7 @@ def main():
             require(history.get("project") == str(root), "History belongs to another project")
             report_path = state / "report.json"
             if args.action == "finalize":
-                return finalize(report_path, root, plan, args.assessment, stamp())
+                return finalize(report_path, root, plan, args.assessment, stamp)
             # Replace any old success before running a new check set.
             write(report_path, {"skill": SKILL, "schema_version": "1.0", "project": str(root),
                                 "status": "BLOCKED", "reason": "Verification incomplete"})
@@ -540,7 +577,8 @@ def main():
             with ThreadPoolExecutor(max_workers=plan["limits"]["workers"]) as pool:
                 rows = list(pool.map(lambda check: execute(check, root, plan["limits"], deadline, state),
                                      plan.get("checks", [])))
-            review, issues = assessment(args.assessment, before, root)
+            data = read(args.assessment) if args.assessment else {}
+            review, issues = assessment(data, before, root)
             scope = git_scope(root, plan)
             try:
                 after = stamp()

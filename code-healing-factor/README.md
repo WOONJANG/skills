@@ -21,6 +21,8 @@ The evidence runner requires Python 3.11 or later. See the [runner guide](refere
 - Optional JUnit XML reports supply execution and skip counts.
 - Git scope reporting flags visible worktree changes outside the fingerprint.
 
+Finalization rejects assessments for a different project, source fingerprint or execution. It refreshes Git scope while preserving the inventory recorded during the original run.
+
 ## Test
 
 Run from the repository root:

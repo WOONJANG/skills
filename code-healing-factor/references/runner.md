@@ -30,3 +30,7 @@ The report includes git_scope. On Git worktrees it lists staged, unstaged, and u
 For pytest, set junit to true and add --junitxml={junit} as one argv element. The runner reads counts from a fresh private JUnit XML file, then discards it. A successful command with no executed cases or missing or invalid XML is BLOCKED. Failed cases or a nonzero command exit are FAIL. Counts cover tests represented in the XML, so deselected cases may be absent. Other test runners can use the same option if they emit UTF-8 JUnit XML with testcase elements.
 
 Set diagnostics to true to keep a structured failure summary from the original execution. It includes the reason, exit code, duration in milliseconds, and any JUnit counts. It omits raw output, assertion messages, and test names. The report still records configured argv and Git paths, so review it before sharing.
+
+Finalization checks the assessment's run ID, project and source fingerprint before applying it. It refreshes git_scope and preserves the execution-time inventory in checked_git_scope. Git scope is advisory and paths outside the plan still require review.
+
+JUnit failures include testcase failures, suite errors and declared failure counts. When no failure is reported, a mismatch between declared test or skip totals and the case details makes the check BLOCKED.
