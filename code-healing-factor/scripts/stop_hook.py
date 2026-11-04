@@ -34,6 +34,7 @@ def respond(event, root, plan_file, state):
         report = read(report_file) if report_file.is_file() else {}
         required = set(plan["required"]).union(LEVELS[plan["level"]])
         if (report.get("status") == "PASS" and report.get("completed") is True and
+                report.get("verification_protocol") == 2 and report.get("finalized") is True and
                 report.get("skill") == SKILL and report.get("schema_version") == "1.0" and
                 report.get("project") == str(root) and report.get("source_fingerprint") == stamp and
                 report.get("checked_fingerprint") == stamp and report.get("plan") == plan and

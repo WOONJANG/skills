@@ -23,6 +23,8 @@ The evidence runner requires Python 3.11 or later. See the [runner guide](refere
 
 Finalization rejects assessments for a different project, source fingerprint or execution. It refreshes Git scope while preserving the inventory recorded during the original run.
 
+Only finalization can return PASS. The runner checks the source fingerprint at each command boundary and rejects a run if it observes a change.
+
 ## Test
 
 Run from the repository root:

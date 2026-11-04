@@ -51,8 +51,40 @@ class RunnerTests(unittest.TestCase):
                                  "--plan", str(self.plan_file), "--assessment", str(self.review_file),
                                  "--entry", str(self.entry)], capture_output=True, text=True,
                                 encoding="utf-8", timeout=15)
+        if action == "run" and expected == 0:
+            self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+            pending = heal.read(self.state / "report.json")
+            assessment = heal.read(self.review_file)
+            heal.write(self.review_file, assessment | {"run_id": pending["run_id"]})
+            self.cli("finalize", review=False)
+            return heal.read(self.state / "report.json")
         self.assertEqual(result.returncode, expected, result.stderr + result.stdout)
         return heal.read(self.state / "report.json") if action == "run" and expected != 3 else result.stdout
+
+    def test_run_cannot_accept_preapproved_g14(self):
+        report = self.cli(expected=2)
+        self.assertEqual(report["gates"]["G14"], "NOT_RUN")
+        self.assertFalse(report["completed"])
+
+    def test_source_change_between_checks_invalidates_evidence(self):
+        changed = CORRECT.replace("* 2", "* 3")
+        self.plan["checks"].extend([
+            {"id": "swap", "gate": "G08", "argv": [PYTHON, "-c",
+             f"from pathlib import Path; Path('app.py').write_text({changed!r})"]},
+            {"id": "verify-swapped", "gate": "G08", "argv": [PYTHON, "-c",
+             "from pathlib import Path; ns={}; exec(Path('app.py').read_text(), ns); "
+             "assert ns['total'](7) == 21"]},
+            {"id": "restore", "gate": "G08", "argv": [PYTHON, "-c",
+             f"from pathlib import Path; Path('app.py').write_text({CORRECT!r})"]},
+        ])
+        self.plan["requirements"] = {"R01": ["verify-swapped"]}
+        report = self.cli(expected=2)
+        self.assertEqual(report["checked_fingerprint"], report["source_fingerprint"])
+        self.assertFalse(report["stable"])
+        self.assertEqual(report["requirements"]["R01"]["status"], "NOT_RUN")
+        review = heal.read(self.review_file)
+        heal.write(self.review_file, review | {"run_id": report["run_id"]})
+        self.cli("finalize", expected=2, review=False)
 
     def test_finalize_reuses_reviewed_execution(self):
         self.cli()

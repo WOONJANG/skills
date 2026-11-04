@@ -376,6 +376,21 @@ def execute(check, root, limits, deadline, state=None):
     return row
 
 
+def current_fingerprint(stamp):
+    try:
+        return stamp()
+    except (OSError, ValueError):
+        return None
+
+
+def execute_with_fingerprint(check, root, limits, deadline, state, stamp, expected):
+    before = current_fingerprint(stamp)
+    row = execute(check, root, limits, deadline, state)
+    after = current_fingerprint(stamp)
+    row["source_stable"] = before == after == expected
+    return row
+
+
 def assessment_matches(data, stamp, root):
     return data.get("fingerprint") == stamp and data.get("project") == str(root)
 
@@ -500,7 +515,8 @@ def finalize(report_path, root, plan, assessment_path, stamp):
     data = read(assessment_path) if assessment_path else {}
     run_id = report.get("run_id")
     fingerprint_now = stamp()
-    if not (run_id and report.get("stable") is True and report.get("project") == str(root)
+    if not (run_id and report.get("verification_protocol") == 2
+            and report.get("stable") is True and report.get("project") == str(root)
             and report.get("plan") == plan
             and report.get("checked_fingerprint") == report.get("source_fingerprint") == fingerprint_now
             and isinstance(data, dict) and data.get("run_id") == run_id
@@ -527,7 +543,7 @@ def finalize(report_path, root, plan, assessment_path, stamp):
         return 2
     report.setdefault("checked_git_scope", report.get("git_scope", {"status": "UNAVAILABLE"}))
     report.update(status=status, gates=gates, assessment=review, issues=issues, git_scope=scope,
-                  blockers=blockers, completed=status == "PASS")
+                  blockers=blockers, finalized=True, completed=status == "PASS")
     write(report_path, report)
     print(json.dumps({"status": status, "report": str(report_path)}))
     return EXIT[status]
@@ -575,20 +591,23 @@ def main():
             before = stamp()
             deadline = time.monotonic() + plan["limits"]["total_seconds"]
             with ThreadPoolExecutor(max_workers=plan["limits"]["workers"]) as pool:
-                rows = list(pool.map(lambda check: execute(check, root, plan["limits"], deadline, state),
-                                     plan.get("checks", [])))
+                rows = list(pool.map(
+                    lambda check: execute_with_fingerprint(
+                        check, root, plan["limits"], deadline, state, stamp, before),
+                    plan.get("checks", []),
+                ))
             data = read(args.assessment) if args.assessment else {}
             review, issues = assessment(data, before, root)
+            review.pop("G14", None)
             scope = git_scope(root, plan)
-            try:
-                after = stamp()
-            except (ValueError, OSError):
-                after = None
-            stable = before == after and config(args.plan) == plan
+            after = current_fingerprint(stamp)
+            stable = (before == after and all(row["source_stable"] for row in rows)
+                      and config(args.plan) == plan)
             status, gates, blockers = evaluate(plan, rows, review, issues, stable)
             report = {"skill": SKILL, "schema_version": "1.0", "project": str(root),
                       "status": status, "level": plan["level"], "plan": plan, "source_fingerprint": after,
                       "run_id": uuid4().hex, "run_started_ns": run_started_ns, "stable": stable,
+                      "verification_protocol": 2, "finalized": False,
                       "requirements": requirement_results(plan, rows, stable), "git_scope": scope,
                       "checked_fingerprint": before, "required": plan["required"],
                       "gates": gates, "checks": rows, "assessment": review,
